@@ -72,8 +72,11 @@ jobs:
         if: steps.detect.outputs.behind != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --head 用 owner:branch 形式，避免分支名中的 `/` 被误解析
           HEAD_BRANCH: sync-from-upstream/main
+          HEAD_REF: ${{ github.repository_owner }}:sync-from-upstream/main
           BASE_BRANCH: patch
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -91,15 +94,24 @@ jobs:
             echo "---"
             echo
             echo "合并后请确认 fork 的 \`patch\` 仍能正常用于依赖构建。"
-          } > /tmp/pr-body.md
+          } > "$RUNNER_TEMP/pr-body.md"
 
-          if gh pr list --head "$HEAD_BRANCH" --base "$BASE_BRANCH" --state open --json number --jq 'length' | grep -q '^0$'; then
+          pr_number=$(gh pr list \
+            --repo "$REPO" \
+            --head "$HEAD_BRANCH" \
+            --base "$BASE_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$pr_number" ]; then
             gh pr create \
+              --repo "$REPO" \
               --base "$BASE_BRANCH" \
-              --head "$HEAD_BRANCH" \
+              --head "$HEAD_REF" \
               --title "chore: sync upstream/main into patch" \
-              --body-file /tmp/pr-body.md
+              --body-file "$RUNNER_TEMP/pr-body.md"
           else
-            echo "::notice::An open PR for $HEAD_BRANCH already exists; it has been updated by the force-push."
-            gh pr list --head "$HEAD_BRANCH" --base "$BASE_BRANCH" --state open --json url --jq '.[].url'
+            echo "::notice::PR #$pr_number already open for $HEAD_BRANCH; it has been updated by the force-push."
+            gh pr view "$pr_number" --repo "$REPO" --json url --jq '.url'
           fi
