@@ -1,0 +1,122 @@
+name: Sync main into patch
+
+# 当本 fork 的 main 有新提交时（例如上一个 sync PR 被合并），
+# 基于 patch 合入 main，推送到临时分支 sync/main-to-patch，
+# 并创建/更新一个目标为 patch 的 PR，由维护者手动合并。
+#
+# patch 只由这个 PR 推进；workflow 自身不改动 patch。
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # 01:30 UTC 每周一 = 09:30 Asia/Shanghai / Asia/Hong_Kong（作为兜底）
+    - cron: "30 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-main-to-patch
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main into patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SOURCE_REF: origin/main
+      TARGET_BRANCH: patch
+      SYNC_BRANCH: sync/main-to-patch
+
+    steps:
+      - name: Checkout patch
+        uses: actions/checkout@v7
+        with:
+          ref: patch
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch main
+        run: |
+          # checkout 检出的是 patch，显式拉取 main 以确保 origin/main 可用
+          git fetch --no-tags origin main
+
+      - name: Detect main updates
+        id: detect
+        run: |
+          behind=$(git rev-list --count "HEAD..$SOURCE_REF")
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "::notice::$TARGET_BRANCH is up to date with $SOURCE_REF. Nothing to do."
+          else
+            echo "::notice::$SOURCE_REF is ahead of $TARGET_BRANCH by $behind commit(s)."
+          fi
+
+      - name: Build sync branch
+        if: steps.detect.outputs.behind != '0'
+        run: |
+          git switch -c "$SYNC_BRANCH"
+          if ! git merge --no-edit -m "chore: sync $SOURCE_REF into $TARGET_BRANCH [skip ci]" "$SOURCE_REF"; then
+            echo "::error::Merge conflict between main and patch. Resolve manually, then push to $SYNC_BRANCH."
+            exit 1
+          fi
+
+      - name: Push sync branch
+        if: steps.detect.outputs.behind != '0'
+        run: |
+          # 复用同名分支：force-push 会同时更新已存在的 PR（策略 A）
+          git push --force origin "$SYNC_BRANCH"
+
+      - name: Create or update pull request
+        if: steps.detect.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          commits=$(git log --no-merges --pretty='- %h %s' "$TARGET_BRANCH..$SOURCE_REF")
+
+          {
+            echo "将本 fork \`main\` 的提交同步到 \`$TARGET_BRANCH\`。"
+            echo
+            echo "本 PR 由 \`${{ github.workflow }}\` workflow 生成，**需要维护者手动 review 并合并**。"
+            echo
+            echo "### main 新增提交"
+            echo
+            echo "$commits"
+            echo
+            echo "---"
+            echo
+            echo "> \`$TARGET_BRANCH\` 是本 fork 的自用分支（含 analyzer 兼容等本地修复），"
+            echo "> 合并后请确认依赖构建仍正常。"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          pr_number=$(gh pr list \
+            --repo "$REPO" \
+            --head "$SYNC_BRANCH" \
+            --base "$TARGET_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$pr_number" ]; then
+            gh pr create \
+              --repo "$REPO" \
+              --base "$TARGET_BRANCH" \
+              --head "$SYNC_BRANCH" \
+              --title "chore: sync main into $TARGET_BRANCH" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            echo "::notice::PR #$pr_number already open for $SYNC_BRANCH; it has been updated by the force-push."
+            gh pr view "$pr_number" --repo "$REPO" --json url --jq '.url'
+          fi
