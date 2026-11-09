@@ -1,0 +1,120 @@
+name: Sync upstream/main into main
+
+# 每周检测上游 GetDutchie/brick 的 main 是否有新提交。
+# 若有：基于本 fork 的 main 合入 upstream/main，推送到临时分支
+#       sync/upstream-to-main，并创建/更新一个目标为 main 的 PR。
+#
+# main 只由这个 PR 推进（维护者手动合并），workflow 自身不改动 main 以外分支。
+# 定时任务只能在默认分支上生效，因此本文件必须存在于 main。
+on:
+  schedule:
+    # 01:00 UTC 每周一 = 09:00 Asia/Shanghai / Asia/Hong_Kong
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-to-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream/main into main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SOURCE_REF: upstream/main
+      TARGET_BRANCH: main
+      SYNC_BRANCH: sync/upstream-to-main
+      UPSTREAM_URL: https://github.com/GetDutchie/brick.git
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+
+      - name: Detect upstream updates
+        id: detect
+        run: |
+          behind=$(git rev-list --count "HEAD..$SOURCE_REF")
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "::notice::$TARGET_BRANCH is up to date with $SOURCE_REF. Nothing to do."
+          else
+            echo "::notice::$SOURCE_REF is ahead of $TARGET_BRANCH by $behind commit(s)."
+          fi
+
+      - name: Build sync branch
+        if: steps.detect.outputs.behind != '0'
+        run: |
+          git switch -c "$SYNC_BRANCH"
+          if ! git merge --no-edit -m "chore: sync $SOURCE_REF into $TARGET_BRANCH [skip ci]" "$SOURCE_REF"; then
+            echo "::error::Merge conflict against $SOURCE_REF. Resolve manually: git fetch upstream && git merge $SOURCE_REF"
+            exit 1
+          fi
+
+      - name: Push sync branch
+        if: steps.detect.outputs.behind != '0'
+        run: |
+          # 复用同名分支：force-push 会同时更新已存在的 PR（策略 A）
+          git push --force origin "$SYNC_BRANCH"
+
+      - name: Create or update pull request
+        if: steps.detect.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          commits=$(git log --no-merges --pretty='- %h %s' "$TARGET_BRANCH..$SOURCE_REF")
+
+          {
+            echo "自动同步上游 [\`GetDutchie/brick\`](https://github.com/GetDutchie/brick) 的 \`main\` 到本 fork 的 \`$TARGET_BRANCH\`。"
+            echo
+            echo "本 PR 由 \`${{ github.workflow }}\` workflow 生成，**需要维护者手动 review 并合并**。"
+            echo
+            echo "### 上游新增提交"
+            echo
+            echo "$commits"
+            echo
+            echo "---"
+            echo
+            echo "合并后 \`Sync main into patch\` 会自动检测到 main 更新，并开出下一个 PR。"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          pr_number=$(gh pr list \
+            --repo "$REPO" \
+            --head "$SYNC_BRANCH" \
+            --base "$TARGET_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$pr_number" ]; then
+            gh pr create \
+              --repo "$REPO" \
+              --base "$TARGET_BRANCH" \
+              --head "$SYNC_BRANCH" \
+              --title "chore: sync upstream/main into $TARGET_BRANCH" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            echo "::notice::PR #$pr_number already open for $SYNC_BRANCH; it has been updated by the force-push."
+            gh pr view "$pr_number" --repo "$REPO" --json url --jq '.url'
+          fi
